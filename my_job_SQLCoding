@@ -1,0 +1,560 @@
+WITH data_bank AS (
+  SELECT *
+  FROM MY_DATA
+)
+, dup_id AS (
+    SELECT
+        *
+        , ROW_NUMBER() OVER (PARTITION BY file_pk,transaction_id, transaction_date, account_number, CAST(balance AS STRING) , CAST(deposit AS STRING), CAST(withdrawal AS STRING),category ORDER BY created_at) AS num_dup_id
+    FROM
+        data_bank
+) 
+,data_id AS (
+    SELECT *
+    FROM dup_id
+    WHERE num_dup_id =1
+)
+, dup_num AS (
+    SELECT
+        *
+        , ROW_NUMBER() OVER (PARTITION BY file_pk, transaction_date, account_number, CAST(balance AS STRING) , CAST(deposit AS STRING), CAST(withdrawal AS STRING) ORDER BY created_at,index) AS num_dup_num
+    FROM
+        data_id
+) 
+,pre_deduplication_flag AS (
+     SELECT *
+           ,CASE 
+           WHEN dn.num_dup_num >= 2
+           THEN 1
+           ELSE NULL
+           END AS new_exclusion_flag_dup
+           ,CASE 
+           WHEN dn.num_dup_num >= 2
+           THEN 'DUP'
+           ELSE NULL
+           END AS new_exclusion_reason_dup
+     FROM dup_num dn
+)
+,deduplication_flag AS (
+    SELECT db.*
+           ,pf.new_exclusion_flag_dup
+           ,pf.new_exclusion_reason_dup
+    FROM data_bank db
+    LEFT JOIN pre_deduplication_flag pf
+    ON db.file_pk=pf.file_pk
+    AND db.index=pf.index
+    AND db.transaction_id=pf.transaction_id
+    AND db.transaction_date=pf.transaction_date
+)
+,check_dup AS (
+     SELECT *
+     FROM deduplication_flag
+     WHERE (exclusion_reason = 'DUP' AND  new_exclusion_reason_dup is NULL)
+     OR (exclusion_reason IS  NULL AND  new_exclusion_reason_dup IS NOT NULL)
+     OR (exclusion_reason != 'DUP' AND new_exclusion_reason_dup IS NOT NULL)
+)
+,check_data_dup AS (
+  SELECT db.*
+  FROM data_bank db
+  LEFT JOIN deduplication_flag pf
+  ON db.file_pk=pf.file_pk
+    AND db.index=pf.index
+    AND db.transaction_id=pf.transaction_id
+    AND db.transaction_date=pf.transaction_date
+    WHERE (db.exclusion_reason = 'DUP' AND  new_exclusion_reason_dup is NULL)
+     OR (db.exclusion_reason IS  NULL AND  new_exclusion_reason_dup IS NOT NULL)
+     OR (db.exclusion_reason != 'DUP' AND new_exclusion_reason_dup IS NOT NULL)
+)
+--P_11 AND P_11C
+,trans_date_set2 AS (
+    SELECT DISTINCT file_pk,transaction_date 
+    FROM deduplication_flag
+)
+,data_for_11 AS (
+    SELECT *
+    FROM deduplication_flag
+    --WHERE new_exclusion_reason_dup IS NULL --OR exclusion_reason IS NULL
+)
+,data_11 AS (
+    SELECT *
+    FROM data_for_11
+    WHERE (category != 'Salary' or category is null) 
+)
+,deposit_dft AS (
+    SELECT  pd.file_pk
+           ,pd.transaction_date
+           ,pd.deposit
+           ,pd.account_number
+           ,pd.exclusion_flag
+           ,pd.exclusion_reason
+           ,ROW_NUMBER() OVER (PARTITION BY ts.file_pk , CAST(deposit AS STRING) ORDER BY index) AS rank_de
+           ,index-1 AS index_de
+           ,index
+    FROM data_for_11 pd
+     JOIN trans_date_set2 ts
+    ON pd.file_pk = ts.file_pk
+    AND pd.transaction_date = ts.transaction_date
+    WHERE  (category != 'Salary' or category is null)
+    AND (deposit > 0)
+    AND (pd.transaction_date = ts.transaction_date)
+    AND new_exclusion_reason_dup IS NULL
+)
+,withdraw_dft AS (
+    SELECT  pd.file_pk
+           ,pd.transaction_date
+           ,pd.withdrawal
+           ,pd.account_number
+           ,ROW_NUMBER() OVER (PARTITION BY ts.file_pk , CAST(withdrawal AS STRING) ORDER BY index) AS rank_de
+           ,index-1 AS index_w
+           ,index
+    FROM data_for_11 pd
+     JOIN trans_date_set2 ts
+    ON pd.file_pk = ts.file_pk
+    AND pd.transaction_date = ts.transaction_date
+    WHERE  (category != 'Salary' or category is null)
+    AND (withdrawal > 0)
+    AND (pd.transaction_date = ts.transaction_date)
+    AND new_exclusion_reason_dup IS NULL
+)
+,pppp11 AS (
+    SELECT  dd.file_pk
+           ,dd.transaction_date
+           ,dd.deposit
+           ,wd.withdrawal
+           ,dd.account_number
+           ,dd.index
+           ,index_w
+           ,index_de
+           ,LAG(wd.index_w) OVER (PARTITION BY wd.file_pk ORDER BY wd.index_w,dd.index_de) AS lag_w
+           ,LAG(dd.index_de) OVER (PARTITION BY dd.file_pk ORDER BY dd.index_de,wd.index_w) AS lag_de
+           ,ROW_NUMBER() OVER (PARTITION BY dd.file_pk,index_de ORDER BY wd.index_w) AS rank_num
+           ,ROW_NUMBER() OVER (PARTITION BY dd.file_pk,index_w ORDER BY dd.index_de) AS rank_num_w
+    FROM withdraw_dft wd 
+    LEFT JOIN deposit_dft dd 
+    ON dd.file_pk = wd.file_pk
+    AND dd.transaction_date = wd.transaction_date
+    AND dd.deposit = wd.withdrawal
+    AND dd.account_number = wd.account_number
+    WHERE dd.transaction_date = wd.transaction_date
+    AND dd.deposit = wd.withdrawal
+    ORDER BY lag_w
+)
+,p1c AS (
+    SELECT  dd.file_pk
+           ,dd.transaction_date
+           ,dd.deposit
+           ,wd.withdrawal
+           ,dd.account_number
+           ,dd.index
+           ,index_w
+           ,index_de
+           ,LAG(wd.index_w) OVER (PARTITION BY wd.file_pk ORDER BY wd.index_w,dd.index_de) AS lag_w
+           ,LAG(dd.index_de) OVER (PARTITION BY dd.file_pk ORDER BY dd.index_de,wd.index_w) AS lag_de
+           ,ROW_NUMBER() OVER (PARTITION BY dd.file_pk,index_de ORDER BY wd.index_w) AS rank_num
+           ,ROW_NUMBER() OVER (PARTITION BY dd.file_pk,index_w ORDER BY dd.index_de) AS rank_num_w
+    FROM withdraw_dft wd 
+    LEFT JOIN deposit_dft dd 
+    ON dd.file_pk = wd.file_pk
+    AND dd.transaction_date = wd.transaction_date
+    AND dd.deposit = wd.withdrawal
+    WHERE dd.transaction_date = wd.transaction_date
+    AND dd.deposit = wd.withdrawal
+    AND dd.account_number != wd.account_number
+    ORDER BY lag_w
+)
+,gruop_row AS (
+    SELECT *
+    FROM pppp11
+    WHERE 
+     ((lag_de != index_de OR lag_de IS NULL ) AND (lag_w != index_w OR lag_w IS NULL))
+    OR ((index_w=lag_w AND index_de=lag_de) AND (rank_num = rank_num_w))
+)
+,gruop_rowp1c AS (
+    SELECT *
+    FROM p1c
+    WHERE 
+     ((lag_de != index_de OR lag_de IS NULL ) AND (lag_w != index_w OR lag_w IS NULL))
+    OR ((index_w=lag_w AND index_de=lag_de) AND (rank_num = rank_num_w))
+)
+,unio AS (
+    SELECT file_pk ,index_de AS row FROM gruop_row
+    UNION ALL
+    SELECT file_pk, index_w AS row FROM gruop_row
+)
+,uniop1c AS (
+    SELECT file_pk ,index_de AS row FROM gruop_rowp1c
+    UNION ALL
+    SELECT file_pk, index_w AS row FROM gruop_rowp1c
+)
+,dis AS (
+    SELECT DISTINCT *
+    FROM unio
+)
+,disp1c AS (
+    SELECT DISTINCT *
+    FROM uniop1c
+)
+,p_11 AS (
+    SELECT df.*
+           ,un.row AS index_p_11
+    FROM data_for_11 df
+    LEFT JOIN dis un
+    ON df.file_pk = un.file_pk
+    AND un.row = df.index-1
+)
+,p_1c AS (
+    SELECT df.*
+           ,un.row AS index_p_11
+    FROM data_for_11 df
+    LEFT JOIN disp1c un
+    ON df.file_pk = un.file_pk
+    AND un.row = df.index-1
+)
+,def_p_11 AS (
+    SELECT *
+           ,CASE
+                WHEN index_p_11 IS NULL 
+                THEN NULL 
+                ELSE 'P_11'
+                END AS new_exclusion_reason_P_11
+    FROM p_11
+)
+,def_p_1c AS (
+    SELECT *
+           ,CASE
+                WHEN index_p_11 IS NULL 
+                THEN NULL 
+                ELSE 'P_11C'
+                END AS new_exclusion_reason_P_11C
+    FROM p_1c
+)
+,data_p11 AS (
+  SELECT db.*
+         ,pf.new_exclusion_reason_P_11
+  FROM data_bank db
+  LEFT JOIN def_p_11 pf
+  ON db.file_pk=pf.file_pk
+    AND db.transaction_id=pf.transaction_id
+    AND db.index = pf.index
+    AND db.transaction_date=pf.transaction_date
+    AND db.created_at=pf.created_at
+    AND db.updated_at=pf.updated_at
+)
+,data_p11c AS (
+  SELECT db.*
+         ,pf.new_exclusion_reason_P_11C
+  FROM data_bank db
+  LEFT JOIN def_p_1c pf
+  ON db.file_pk=pf.file_pk
+    AND db.transaction_id=pf.transaction_id
+    AND db.index = pf.index
+    AND db.transaction_date=pf.transaction_date
+    AND db.created_at=pf.created_at
+    AND db.updated_at=pf.updated_at
+)
+,data_p11_p11c AS (
+  SELECT db.*
+         ,pf.new_exclusion_reason_P_11C
+  FROM data_p11 db
+  JOIN data_p11c pf
+  ON db.file_pk=pf.file_pk
+    AND db.transaction_id=pf.transaction_id
+    AND db.index = pf.index
+    AND db.transaction_date=pf.transaction_date
+    AND db.created_at=pf.created_at
+    AND db.updated_at=pf.updated_at
+)
+,check_p_11 AS (
+    SELECT *
+    FROM data_p11
+    WHERE 
+    (exclusion_reason = 'P_11' AND  new_exclusion_reason_P_11 IS NULL)
+     OR (exclusion_reason IS  NULL AND  new_exclusion_reason_P_11 IS NOT NULL)
+)
+,check_p_11c AS (
+    SELECT *
+    FROM data_p11c
+    WHERE 
+    (exclusion_reason = 'P_11C' AND  new_exclusion_reason_P_11C IS NULL)
+     OR (exclusion_reason IS  NULL AND  new_exclusion_reason_P_11C IS NOT NULL)
+)
+--P_1M
+,exclude_flag_cte AS (
+    SELECT *
+           ,index-1 AS index_py
+    FROM data_id
+    WHERE  (exclusion_reason != 'DUP' OR exclusion_reason is null)
+    AND (category != 'Salary' OR category is null)
+)
+,grouped_data AS (
+    SELECT *,
+        ROW_NUMBER() OVER (PARTITION BY file_pk ORDER BY index_py ) AS payment_group
+    FROM exclude_flag_cte
+    WHERE deposit > 0
+)
+, join_data AS (
+    SELECT ec.*
+           ,gd.payment_group
+    FROM exclude_flag_cte ec
+    LEFT JOIN grouped_data gd
+    ON ec.file_pk = gd.file_pk 
+    AND ec.transaction_id = gd.transaction_id 
+    AND ec.transaction_date = gd.transaction_date
+)
+, RankedGroups AS (
+  SELECT
+    *,
+    MAX(payment_group) OVER (PARTITION BY file_pk) AS max_payment_group
+    ,SUM(CASE WHEN deposit > 0 THEN 1 ELSE 0 END) OVER (PARTITION BY file_pk ORDER BY index) AS new_payment_group
+  FROM join_data
+)
+,cumulative_flag1 AS (
+    SELECT *
+           ,SUM(withdrawal) OVER (PARTITION BY file_pk,new_payment_group ORDER BY index) AS cumsum
+    FROM RankedGroups
+)
+,cumulative_flag2 AS (
+    SELECT *
+           ,MAX(deposit) OVER (PARTITION BY file_pk,new_payment_group ) AS max_deposit
+           ,MAX(cumsum) OVER (PARTITION BY file_pk,new_payment_group ) AS max_cumsum
+    FROM cumulative_flag1
+)
+,cumulative_flag3 AS (
+    SELECT *
+           ,CASE 
+                WHEN max_deposit > 0 
+                THEN max_cumsum/max_deposit
+                ELSE 0
+                END AS diff
+    FROM cumulative_flag2
+)
+,final_cumulative_flag2 AS (
+    SELECT *
+           ,CASE 
+               WHEN diff <= 1.02 AND diff>=0.98 THEN 1
+               ELSE NULL
+               END AS new_exclusion_flag_p1m
+            ,CASE
+               WHEN diff <= 1.02 AND diff>=0.98 THEN 'P_1M'
+               ELSE NULL 
+               END AS new_exclusion_reason_p1m
+    FROM cumulative_flag3
+    ORDER BY index 
+)
+,final_cumulative_flag AS (
+  SELECT db.*
+         ,pf.new_exclusion_flag_p1m
+         ,pf.new_exclusion_reason_p1m
+  FROM data_bank db
+  LEFT JOIN final_cumulative_flag2 pf
+  ON db.file_pk=pf.file_pk
+    AND db.transaction_id=pf.transaction_id
+    AND db.index = pf.index
+    AND db.transaction_date=pf.transaction_date
+
+)
+,flag_overlap AS (
+  SELECT db.*
+         ,CASE 
+              WHEN new_exclusion_reason_P_11 IS NULL AND new_exclusion_reason_P_11C IS NULL 
+              THEN new_exclusion_reason_p1m
+              WHEN new_exclusion_reason_p1m IS NULL AND
+               new_exclusion_reason_P_11 IS NULL AND new_exclusion_reason_P_11C IS NOT NULL
+              THEN new_exclusion_reason_P_11C
+              WHEN new_exclusion_reason_p1m IS NULL AND
+               new_exclusion_reason_P_11 IS NOT NULL AND new_exclusion_reason_P_11C IS NULL 
+              THEN new_exclusion_reason_P_11
+              WHEN new_exclusion_reason_p1m IS NOT NULL AND
+               (new_exclusion_reason_P_11 IS NOT NULL OR new_exclusion_reason_P_11C IS NOT NULL)
+              THEN new_exclusion_reason_p1m
+              ELSE NULL 
+              END AS new_exclusion_reason_overlap
+  FROM final_cumulative_flag db
+  JOIN data_p11_p11c pf
+  ON db.file_pk=pf.file_pk
+    AND db.transaction_id=pf.transaction_id
+    AND db.index = pf.index
+    AND db.transaction_date=pf.transaction_date
+
+)
+,check_p_1m AS (
+    SELECT *
+    FROM final_cumulative_flag
+    WHERE (exclusion_reason = 'P_1M' AND new_exclusion_reason_p1m IS NULL)
+    OR (exclusion_reason IS  NULL AND  new_exclusion_reason_p1m IS NOT NULL)
+)
+,check_overlap AS (
+    SELECT *
+    FROM flag_overlap
+    WHERE (exclusion_reason IN ('P_1M','P_11','P_1C') AND new_exclusion_reason_overlap IS NULL)
+    OR (exclusion_reason IS  NULL AND  new_exclusion_reason_overlap IS NOT NULL)
+)
+--P_SER_IN,P_SER_OUT
+,bank_name_cte AS (
+    SELECT *,
+        CASE
+            WHEN bank_code IN ('th-kbank', 'th-scb', 'th-ktb', 'th-ttb', 'th-bay') THEN
+                        CASE
+                           WHEN bank_code = 'th-ktb' THEN ARRAY_TO_STRING(REGEXP_EXTRACT_ALL(LOWER(particular), r'[0-9]+'), '')
+                        ELSE ARRAY_TO_STRING(REGEXP_EXTRACT_ALL(LOWER(particular), r'[ /][Xx][0-9]{4,}'), '')
+                        END
+            ELSE NULL
+        END AS fnd_list
+        ,CASE 
+           WHEN bank_code IN ('th-ktb' ,'th-bay' ) THEN 6
+           ELSE 4 
+        END AS lnth
+    FROM data_id
+)
+,cut AS (
+    SELECT *
+           , CASE WHEN bank_code = 'th-ktb' AND LENGTH(fnd_list) < 8 THEN ''
+             ELSE fnd_list
+             END AS fnd_list2
+    FROM bank_name_cte
+)
+,bank_name_contact_with AS (
+    SELECT *,
+        CASE
+            WHEN LENGTH(fnd_list2) >= lnth + 2 THEN
+                CASE
+                    WHEN bank_code NOT IN ('th-ktb', 'th-scb', 'th-kbank') THEN
+                        SUBSTRING(fnd_list2, 1, lnth + 2)
+                    ELSE
+                        CASE
+                            WHEN fnd_list2 = '' THEN NULL
+                            ELSE SUBSTRING(fnd_list2, LENGTH(fnd_list2) - 3)
+                        END
+                END
+            ELSE
+                CASE
+                    WHEN fnd_list2 = '' THEN NULL
+                    ELSE SUBSTRING(fnd_list2, LENGTH(fnd_list2) - 3)
+                END
+        END AS contact_with_be
+    FROM cut
+)
+,bank_name_contact_with_for4 AS (
+    SELECT *
+           ,CASE 
+                WHEN bank_code = 'th-kbank' 
+                THEN REGEXP_EXTRACT(fnd_list2, r'x([0-9]+)')                
+                ELSE SUBSTRING(contact_with_be, LENGTH(contact_with_be) - 3)
+                END AS  new_contact_with
+           , SUBSTRING(contact_with_be, LENGTH(contact_with_be) - 3) AS contact_with
+    FROM bank_name_contact_with
+)
+,temp_df AS (
+    SELECT *
+    FROM bank_name_contact_with_for4
+    WHERE (exclusion_reason NOT IN ('DUP', 'OWN') OR exclusion_reason is null)
+)
+,contact_with_count AS (
+    SELECT  file_pk
+           ,new_contact_with
+           , COUNT(new_contact_with)  AS contact_count
+    FROM temp_df
+    WHERE new_contact_with IS NOT NULL
+    GROUP BY file_pk,new_contact_with 
+)
+,threshold2 AS (
+    SELECT  file_pk
+            ,new_contact_with
+            ,SUM(contact_count) OVER (PARTITION BY file_pk) AS total_contact_count
+    FROM contact_with_count
+)
+,threshold AS (
+    SELECT  file_pk
+            ,new_contact_with
+            ,ROUND(total_contact_count * 0.2) AS threshold_value
+    FROM threshold2
+)
+,p_ser_list AS (
+    SELECT cc.* ,threshold_value
+    FROM threshold ts
+    JOIN contact_with_count cc ON ts.file_pk = cc.file_pk AND ts.new_contact_with = cc.new_contact_with
+    WHERE contact_count > 5 AND 
+    contact_count > threshold_value
+)
+,post_filter AS (
+    SELECT *
+    FROM temp_df
+    WHERE (category != 'Salary' OR category IS NULL)
+    AND (exclusion_reason NOT IN ('DUP', 'P_11','P_11C','P_1M','SD3X','SD2X') OR exclusion_reason is null)
+
+)
+,add_p_ser_in_out_to_df AS (
+    SELECT pf.*
+           ,CASE 
+               WHEN ps.new_contact_with = pf.new_contact_with THEN 1
+               ELSE pf.exclusion_flag
+            END AS new_exclusion_flag
+           ,CASE 
+               WHEN pf.deposit > 0 AND ps.new_contact_with = pf.new_contact_with THEN 'P_SER_IN'
+               WHEN withdrawal > 0 AND ps.new_contact_with = pf.new_contact_with THEN 'P_SER_OUT'
+               ELSE NULL
+            END AS new_exclusion_reason_pser
+    FROM post_filter pf
+    LEFT JOIN p_ser_list ps ON ps.new_contact_with = pf.new_contact_with AND pf.file_pk = ps.file_pk
+    WHERE (category != 'Salary' OR category IS NULL)
+)
+,check_p_ser AS (
+    SELECT *
+FROM add_p_ser_in_out_to_df
+ WHERE 
+ (exclusion_reason IN ('P_SER_IN','P_SER_OUT') AND  new_exclusion_reason_pser IS NULL)
+ OR (exclusion_reason IS  NULL AND  new_exclusion_reason_pser IS NOT NULL)
+ OR (exclusion_reason NOT IN ('P_SER_IN','P_SER_OUT') AND new_exclusion_reason_pser IS NOT NULL) --เพราะว่า P_SER ไม่โดน flag ทับ
+)
+,check_p_ser2 AS (
+    SELECT *
+FROM add_p_ser_in_out_to_df pf
+RIGHT JOIN data_id db
+ON db.file_pk=pf.file_pk
+    AND db.index=pf.index
+    AND db.transaction_id=pf.transaction_id
+    AND db.transaction_date=pf.transaction_date
+ WHERE 
+ (db.exclusion_reason IN ('P_SER_IN','P_SER_OUT') AND  new_exclusion_reason_pser IS NULL)
+ OR (db.exclusion_reason IS  NULL AND  new_exclusion_reason_pser IS NOT NULL)
+ OR (db.exclusion_reason NOT IN ('P_SER_IN','P_SER_OUT') AND new_exclusion_reason_pser IS NOT NULL) --เพราะว่า P_SER ไม่โดน flag ทับ
+)
+,one_new_flag AS (
+  SELECT db.file_pk
+       ,db.index
+       ,db.transaction_id
+       ,db.exclusion_reason
+       ,CASE 
+            WHEN new_exclusion_reason_dup IS NOT NULL THEN new_exclusion_reason_dup
+            WHEN new_exclusion_reason_overlap IS NOT NULL THEN new_exclusion_reason_overlap
+            WHEN new_exclusion_reason_pser IS NOT NULL THEN new_exclusion_reason_pser
+            ELSE NULL 
+            END AS new_exclusion_reason
+  FROM data_bank db
+  LEFT JOIN deduplication_flag pf
+  ON db.file_pk=pf.file_pk
+    AND db.index=pf.index
+    AND db.transaction_id=pf.transaction_id
+    AND db.transaction_date=pf.transaction_date
+  LEFT JOIN flag_overlap fo
+  ON db.file_pk=fo.file_pk
+    AND db.index=fo.index
+    AND db.transaction_id=fo.transaction_id
+    AND db.transaction_date=fo.transaction_date
+  LEFT JOIN add_p_ser_in_out_to_df ps
+  ON db.file_pk=ps.file_pk
+    AND db.index=ps.index
+    AND db.transaction_id=ps.transaction_id
+    AND db.transaction_date=ps.transaction_date
+)
+,check_all AS (
+  SELECT *
+  FROM one_new_flag
+  WHERE exclusion_reason != new_exclusion_reason 
+  OR (exclusion_reason IS NULL AND new_exclusion_reason IS NOT NULL)
+  OR (exclusion_reason IS NOT NULL AND new_exclusion_reason IS NULL)
+  AND exclusion_reason NOT IN ('SD3X','SD2X')
+)
+
+SELECT *
+FROM check_all
